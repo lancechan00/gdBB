@@ -33,6 +33,7 @@ typedef enum {
     CHAT_PHASE_SILENT = 0,   // 静默期：无 WS（当前仅日志模拟）
     CHAT_PHASE_WAITING = 1,  // 等待期：WS 常连但不上传（当前仅日志模拟）
     CHAT_PHASE_WAKE = 2,     // 唤醒期：持续上传（当前仅日志模拟）
+    CHAT_PHASE_PLAYBACK = 3, // 播放期：有下行音频在播，播完再回等待期（用于抑制回声触发唤醒）
 } chat_phase_t;
 
 typedef enum {
@@ -49,7 +50,6 @@ typedef struct {
     task_chat_continue_cfg_t cfg;
     app_speak_sound_cfg_t audio_cfg;
 
-    QueueHandle_t q_utt;          // utterance_t*
     QueueHandle_t q_evt;          // chat_evt_t
     RingbufHandle_t rb_play;      // raw PCM bytes
 
@@ -57,24 +57,29 @@ typedef struct {
     volatile bool playing;
     volatile uint32_t abort_token; // 递增即可触发打断（避免 bool 粘滞）
 
-    // VAD
-    float noise;
-    int start_on_frames;          // 防抖：连续多少帧算开始
-
     // phase
     volatile chat_phase_t phase;
     uint32_t last_activity_tick;
 
-    // pre-roll circular buffer (PSRAM)
+    // audio circular buffer (PSRAM): 始终循环存储麦克风 PCM
     uint8_t *pre_rb;
     size_t pre_cap;
-    size_t pre_w;
-    bool pre_full;
     size_t pre_preroll_bytes;     // 1.5s 对应 bytes
+    volatile uint64_t pre_seq_w;  // 已写入总字节数（单调递增）
+    uint64_t send_seq_r;          // 唤醒期发送指针（单调递增，<= pre_seq_w）
+    size_t bytes_per_sec;         // sr*ch*bps/8
 
-    // wake logging (rate limit)
-    uint32_t wake_last_log_tick;
-    size_t wake_rt_bytes_acc;
+    // send pacing / backlog control
+    uint32_t last_catchup_log_tick;
+
+    // WS session (keep-alive in WAITING)
+    app_rb3_ws_sess_t *ws;
+
+    // play buffering control
+    volatile uint32_t play_bytes_in;
+    uint32_t play_prefill_bytes; // 至少缓存多少再开始播（默认 1s）
+    uint32_t play_low_wm_bytes;  // 低水位：降到此以下才恢复快速入队
+    uint32_t play_high_wm_bytes; // 高水位：超过则对下行做背压
 } chat_ctx_t;
 
 typedef struct {
@@ -100,6 +105,33 @@ static float frame_mean_abs_16(const int16_t *x, int n)
     return (n > 0) ? (float)sum / (float)n : 0.0f;
 }
 
+// forward decl: used by on_audio_push_rb_track()
+static esp_err_t on_audio_push_rb(const uint8_t *pcm, size_t pcm_len, bool is_last, void *ctx);
+
+static bool is_playback_active(chat_ctx_t *c)
+{
+    if (!c) return false;
+    // playing=true 表示 task_play 近期/当前在写 spk；
+    // play_bytes_in>0 表示 ringbuf 里仍有待播数据。
+    if (c->playing) return true;
+    if (__atomic_load_n(&c->play_bytes_in, __ATOMIC_RELAXED) > 0) return true;
+    return false;
+}
+
+typedef struct {
+    chat_ctx_t *c;
+    bool *got_audio;
+} dl_audio_ctx_t;
+
+static esp_err_t on_audio_push_rb_track(const uint8_t *pcm, size_t pcm_len, bool is_last, void *ctx)
+{
+    dl_audio_ctx_t *d = (dl_audio_ctx_t *)ctx;
+    if (d && d->got_audio && pcm && pcm_len > 0) {
+        *(d->got_audio) = true;
+    }
+    return on_audio_push_rb(pcm, pcm_len, is_last, d ? d->c : NULL);
+}
+
 static esp_err_t on_audio_push_rb(const uint8_t *pcm, size_t pcm_len, bool is_last, void *ctx)
 {
     (void)is_last;
@@ -109,14 +141,31 @@ static esp_err_t on_audio_push_rb(const uint8_t *pcm, size_t pcm_len, bool is_la
     // 如果已经被打断（turn_id 变化），丢弃后续 audio
     uint32_t cur_turn = c->turn_id;
 
-    // copy to ringbuffer (ringbuf 负责分配内部节点内存)
-    BaseType_t ok = xRingbufferSend(c->rb_play, pcm, pcm_len, pdMS_TO_TICKS(200));
-    if (ok != pdTRUE) {
-        ESP_LOGW(TAG, "play ringbuf full, drop %u bytes (turn=%" PRIu32 ")", (unsigned)pcm_len, cur_turn);
-    } else {
-        c->playing = true;
+    // 若上层已触发打断，尽快退出（让 ws_recv 结束）
+    uint32_t abort0 = c->abort_token;
+
+    // 背压：如果播放缓冲高于高水位，先等它消耗到低水位再继续入队
+    // 目的：避免“服务端灌得太快 -> ringbuf 满 -> 丢块 -> 听起来卡”
+    while (__atomic_load_n(&c->play_bytes_in, __ATOMIC_RELAXED) > c->play_high_wm_bytes) {
+        if (c->abort_token != abort0) return ESP_ERR_INVALID_STATE;
+        vTaskDelay(pdMS_TO_TICKS(20));
+        if (__atomic_load_n(&c->play_bytes_in, __ATOMIC_RELAXED) <= c->play_low_wm_bytes) break;
     }
-    return ESP_OK;
+
+    // copy to ringbuffer (ringbuf 负责分配内部节点内存)
+    // 不再“满就丢”：而是等一等（同时让 TCP 背压生效）
+    for (;;) {
+        if (c->abort_token != abort0) return ESP_ERR_INVALID_STATE;
+        BaseType_t ok = xRingbufferSend(c->rb_play, pcm, pcm_len, pdMS_TO_TICKS(200));
+        if (ok == pdTRUE) {
+            (void)__atomic_fetch_add(&c->play_bytes_in, (uint32_t)pcm_len, __ATOMIC_RELAXED);
+            c->playing = true;
+            return ESP_OK;
+        }
+        // 仍然满：稍等再试（避免刷屏，只在满时偶尔提示）
+        ESP_LOGW(TAG, "play ringbuf full, wait... drop=0 bytes (turn=%" PRIu32 ")", cur_turn);
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
 }
 
 static void flush_play_rb(chat_ctx_t *c)
@@ -127,6 +176,7 @@ static void flush_play_rb(chat_ctx_t *c)
     while ((item = xRingbufferReceive(c->rb_play, &item_size, 0)) != NULL) {
         vRingbufferReturnItem(c->rb_play, item);
     }
+    __atomic_store_n(&c->play_bytes_in, 0, __ATOMIC_RELAXED);
 }
 
 static void task_play(void *arg)
@@ -134,6 +184,7 @@ static void task_play(void *arg)
     chat_ctx_t *c = (chat_ctx_t *)arg;
     const int chunk = (c->cfg.spk_chunk_bytes > 0) ? c->cfg.spk_chunk_bytes : 512;
     uint32_t last_abort = c->abort_token;
+    bool prefilled = false;
 
     while (1) {
         // 若收到打断请求，即使当前无音频也要清一次队列
@@ -141,13 +192,26 @@ static void task_play(void *arg)
             flush_play_rb(c);
             c->playing = false;
             last_abort = c->abort_token;
+            prefilled = false;
             vTaskDelay(pdMS_TO_TICKS(20)); // 让 DMA 自然消耗一点点，降低爆音概率
+        }
+
+        // 至少缓存一定数据再开始播放（降低网络抖动导致的卡顿）
+        if (!prefilled) {
+            uint32_t inb = __atomic_load_n(&c->play_bytes_in, __ATOMIC_RELAXED);
+            if (inb < c->play_prefill_bytes) {
+                vTaskDelay(pdMS_TO_TICKS(20));
+                continue;
+            }
+            prefilled = true;
+            ESP_LOGI(TAG, "play prefill ok: %u bytes, start playback", (unsigned)inb);
         }
 
         size_t item_size = 0;
         uint8_t *item = (uint8_t *)xRingbufferReceive(c->rb_play, &item_size, pdMS_TO_TICKS(200));
         if (!item) {
             c->playing = false;
+            prefilled = false; // underrun：等下次再凑够 prefill
             continue;
         }
 
@@ -164,11 +228,15 @@ static void task_play(void *arg)
         }
 
         vRingbufferReturnItem(c->rb_play, item);
+        if (item_size > 0) {
+            (void)__atomic_fetch_sub(&c->play_bytes_in, (uint32_t)item_size, __ATOMIC_RELAXED);
+        }
 
         if (c->abort_token != last_abort) {
             flush_play_rb(c);
             c->playing = false;
             last_abort = c->abort_token;
+            prefilled = false;
             vTaskDelay(pdMS_TO_TICKS(20));
         }
     }
@@ -177,28 +245,59 @@ static void task_play(void *arg)
 static void prebuf_write(chat_ctx_t *c, const uint8_t *data, size_t len)
 {
     if (!c || !c->pre_rb || c->pre_cap == 0 || !data || len == 0) return;
-    // 静默期不存：按需求“静默->唤醒时无前1.5s”
-    if (c->phase == CHAT_PHASE_SILENT) return;
+
+    // 统一策略：无论等待期/唤醒期/静默期，都持续循环存音频
+    uint64_t seq = __atomic_load_n(&c->pre_seq_w, __ATOMIC_RELAXED);
+    size_t w = (size_t)(seq % c->pre_cap);
 
     size_t off = 0;
     while (off < len) {
         size_t n = len - off;
-        size_t space = c->pre_cap - c->pre_w;
+        size_t space = c->pre_cap - w;
         if (n > space) n = space;
-        memcpy(c->pre_rb + c->pre_w, data + off, n);
-        c->pre_w += n;
+        memcpy(c->pre_rb + w, data + off, n);
+        w += n;
         off += n;
-        if (c->pre_w >= c->pre_cap) {
-            c->pre_w = 0;
-            c->pre_full = true;
-        }
+        if (w >= c->pre_cap) w = 0;
     }
+
+    // 写入完成后再推进 seq，读线程只会读 <= seq 的数据
+    __atomic_store_n(&c->pre_seq_w, seq + len, __ATOMIC_RELEASE);
+}
+
+static size_t prebuf_copy(chat_ctx_t *c, uint64_t seq, uint8_t *dst, size_t len)
+{
+    if (!c || !c->pre_rb || !dst || len == 0 || c->pre_cap == 0) return 0;
+
+    size_t off = 0;
+    size_t r = (size_t)(seq % c->pre_cap);
+    while (off < len) {
+        size_t n = len - off;
+        size_t space = c->pre_cap - r;
+        if (n > space) n = space;
+        memcpy(dst + off, c->pre_rb + r, n);
+        r += n;
+        off += n;
+        if (r >= c->pre_cap) r = 0;
+    }
+    return len;
 }
 
 static void on_speak_state_change(app_speak_state_t st, void *ctx)
 {
     chat_ctx_t *c = (chat_ctx_t *)ctx;
     if (!c || !c->q_evt) return;
+
+    // 关键：一旦开始说话，立即触发 abort，让 recv/play 能立刻被打断
+    if (st == APP_SPEAK_STATE_SPEAKING) {
+        // 播放期/播放中：忽略 SPEAK_ON（否则扬声器回灌会立刻再次唤醒）
+        if (is_playback_active(c)) {
+            return;
+        }
+        c->abort_token++;
+        flush_play_rb(c);
+    }
+
     chat_evt_t ev = {
         .type = (st == APP_SPEAK_STATE_SPEAKING) ? CHAT_EVT_SPEAK_ON : CHAT_EVT_SPEAK_OFF,
         .tick = xTaskGetTickCount(),
@@ -212,291 +311,234 @@ static void on_speak_audio_frame(const uint8_t *pcm, int pcm_len, void *ctx)
     if (!c || !pcm || pcm_len <= 0) return;
 
     prebuf_write(c, pcm, (size_t)pcm_len);
-
-    // 唤醒期：模拟“实时上传”日志（限频，避免刷屏）
-    if (c->phase == CHAT_PHASE_WAKE) {
-        c->wake_rt_bytes_acc += (size_t)pcm_len;
-        uint32_t now = xTaskGetTickCount();
-        if (now - c->wake_last_log_tick >= pdMS_TO_TICKS(500)) {
-            c->wake_last_log_tick = now;
-            ESP_LOGI(TAG, "唤醒期: 模拟实时上传中... +%u bytes", (unsigned)c->wake_rt_bytes_acc);
-            c->wake_rt_bytes_acc = 0;
-        }
-    }
 }
 
 static void task_net(void *arg)
 {
     chat_ctx_t *c = (chat_ctx_t *)arg;
-    // 先不做真实 WS：只用日志模拟三态 + “前1.5s + 实时”发送顺序
+    ESP_ERROR_CHECK(nvs_flash_init());
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    ESP_ERROR_CHECK(example_connect());
+
+    app_rb3_cfg_t rb3 = app_rb3_cfg_default(c->cfg.base_url);
+    // 关键：下行音频格式要和本机播放采样率一致；全链路改成 24k。
+    rb3.af = "pcm_24k_16bit";
+    rb3.mode = "stream";
+    rb3.chunk_bytes = 500;
+
+    // 等待期默认保持 WS 连接（长连接）
     c->phase = CHAT_PHASE_WAITING;
     c->last_activity_tick = xTaskGetTickCount();
-    ESP_LOGI(TAG, "状态切换: 启动 -> 等待期（WS常连但不上传，开始循环存音频）");
-    ESP_LOGI(TAG, "规则: 等待期空闲60s -> 静默期；静默期说话 -> 唤醒期(无前1.5s)；等待期说话 -> 唤醒期(先前1.5s再实时)；说完->等待期(end不关WS)");
+    ESP_LOGI(TAG, "状态切换: 启动 -> 等待期（保持WS连接，不上传；持续循环存音频）");
+
+    if (app_rb3_ws_open(&rb3, &c->ws) != ESP_OK) {
+        ESP_LOGW(TAG, "ws open failed, will retry on next wake");
+        c->ws = NULL;
+    }
 
     const uint32_t idle_to_silent_ms = 60000;
-    const TickType_t wait_ticks = pdMS_TO_TICKS(200);
+    const size_t max_backlog = c->bytes_per_sec * 3;  // 最多允许落后 3s
+    const size_t keep_backlog = c->bytes_per_sec * 1; // 追帧后保留 1s
+    const int send_chunk = 4096;                      // SRAM bounce buffer
+    uint8_t *txbuf = (uint8_t *)malloc(send_chunk);
+    if (!txbuf) {
+        ESP_LOGE(TAG, "alloc txbuf failed");
+        vTaskDelete(NULL);
+        return;
+    }
+
+    // 用于 WS 打断：token 变化即 abort
+    uint32_t last_abort_seen = c->abort_token;
+    abort_ctx_t ab = {
+        .c = c,
+        .last_abort_seen = &last_abort_seen,
+    };
+
+    bool round_active = false;
 
     while (1) {
+        // 播放期：等下行音频播完再回到等待期
+        if (c->phase == CHAT_PHASE_PLAYBACK) {
+            if (!is_playback_active(c)) {
+                ESP_LOGI(TAG, "状态切换: 播放期 -> 等待期（下行播完）");
+                c->phase = CHAT_PHASE_WAITING;
+                c->last_activity_tick = xTaskGetTickCount();
+            } else {
+                // 播放中也算“活跃”，避免被 idle->silent 误关 WS
+                c->last_activity_tick = xTaskGetTickCount();
+            }
+        }
+
+        // 处理状态事件（非阻塞）
         chat_evt_t ev = {0};
-        TickType_t now = xTaskGetTickCount();
-        if (xQueueReceive(c->q_evt, &ev, wait_ticks) == pdTRUE) {
+        while (xQueueReceive(c->q_evt, &ev, 0) == pdTRUE) {
             uint32_t tnow = xTaskGetTickCount();
+            c->last_activity_tick = tnow;
+
             if (ev.type == CHAT_EVT_SPEAK_ON) {
-                if (c->phase == CHAT_PHASE_WAITING) {
-                    c->phase = CHAT_PHASE_WAKE;
-                    c->last_activity_tick = tnow;
-                    c->wake_last_log_tick = tnow;
-                    c->wake_rt_bytes_acc = 0;
-                    ESP_LOGI(TAG, "状态切换: 等待期 -> 唤醒期");
-                    ESP_LOGI(TAG, "模拟发送: 先发前1.5s缓存 bytes=%u，再发实时数据", (unsigned)c->pre_preroll_bytes);
-                } else if (c->phase == CHAT_PHASE_SILENT) {
-                    c->phase = CHAT_PHASE_WAKE;
-                    c->last_activity_tick = tnow;
-                    c->wake_last_log_tick = tnow;
-                    c->wake_rt_bytes_acc = 0;
-                    ESP_LOGI(TAG, "状态切换: 静默期 -> 唤醒期");
-                    ESP_LOGI(TAG, "模拟发送: 静默期无前1.5s，直接发实时数据");
-                } else {
-                    c->last_activity_tick = tnow;
+                // 播放期：不允许再次唤醒（抑制回声触发唤醒）
+                if (c->phase == CHAT_PHASE_PLAYBACK) {
+                    continue;
                 }
+                if (c->phase == CHAT_PHASE_WAITING) {
+                    ESP_LOGI(TAG, "状态切换: 等待期 -> 唤醒期");
+                } else if (c->phase == CHAT_PHASE_SILENT) {
+                    ESP_LOGI(TAG, "状态切换: 静默期 -> 唤醒期");
+                }
+                c->phase = CHAT_PHASE_WAKE;
+                round_active = true;
+                last_abort_seen = c->abort_token;
+
+                // 确保 WS 已连接
+                if (!c->ws || !app_rb3_ws_is_connected(c->ws)) {
+                    if (c->ws) app_rb3_ws_close(c->ws);
+                    c->ws = NULL;
+                    if (app_rb3_ws_open(&rb3, &c->ws) != ESP_OK) {
+                        ESP_LOGE(TAG, "ws open failed");
+                        c->phase = CHAT_PHASE_WAITING;
+                        round_active = false;
+                        break;
+                    }
+                }
+
+                // start
+                if (app_rb3_ws_send_start(c->ws, "r_chat", rb3.af) != ESP_OK) {
+                    ESP_LOGE(TAG, "ws send start failed");
+                    app_rb3_ws_close(c->ws);
+                    c->ws = NULL;
+                    c->phase = CHAT_PHASE_WAITING;
+                    round_active = false;
+                    break;
+                }
+
+                // 设置发送指针：从“当前时刻前 1.5s”开始，然后追到实时
+                uint64_t seq_w = __atomic_load_n(&c->pre_seq_w, __ATOMIC_ACQUIRE);
+                uint64_t min_seq = (seq_w > c->pre_cap) ? (seq_w - c->pre_cap) : 0;
+                uint64_t target = (seq_w > c->pre_preroll_bytes) ? (seq_w - c->pre_preroll_bytes) : 0;
+                if (target < min_seq) {
+                    uint64_t lost = min_seq - target;
+                    target = min_seq;
+                    ESP_LOGW(TAG, "preroll 不足：被覆盖 %" PRIu64 " bytes，改为发送可用窗口", lost);
+                }
+                c->send_seq_r = target;
+                ESP_LOGI(TAG, "上传: start -> preroll -> realtime, preroll_bytes=%" PRIu64,
+                         (seq_w >= target) ? (seq_w - target) : 0);
             } else if (ev.type == CHAT_EVT_SPEAK_OFF) {
                 if (c->phase == CHAT_PHASE_WAKE) {
-                    c->phase = CHAT_PHASE_WAITING;
-                    c->last_activity_tick = tnow;
-                    ESP_LOGI(TAG, "状态切换: 唤醒期 -> 等待期");
-                    ESP_LOGI(TAG, "模拟发送: end（保持WS，不关闭；回到等待期继续循环存音频）");
-                } else {
-                    c->last_activity_tick = tnow;
+                    // 注意：这里不立刻切回等待期。
+                    // 若服务端有下行音频，则进入“播放期”，等播完再切回等待期（避免回声再次唤醒）。
+                    if (c->ws && app_rb3_ws_is_connected(c->ws)) {
+                        (void)app_rb3_ws_send_end(c->ws);
+                        ESP_LOGI(TAG, "上传: end（保持WS连接）");
+
+                        app_rb3_meta_t meta = {0};
+                        bool got_audio = false;
+                        dl_audio_ctx_t dl = {
+                            .c = c,
+                            .got_audio = &got_audio,
+                        };
+                        esp_err_t rxret = app_rb3_ws_recv_until_last(c->ws, &meta, on_audio_push_rb_track, &dl,
+                                                                     should_abort_ws, &ab);
+                        if (rxret == ESP_ERR_INVALID_STATE) {
+                            ESP_LOGI(TAG, "ws recv cancelled");
+                        } else if (rxret != ESP_OK) {
+                            ESP_LOGE(TAG, "ws recv failed: %s", esp_err_to_name(rxret));
+                            if (c->ws) {
+                                app_rb3_ws_close(c->ws);
+                                c->ws = NULL;
+                            }
+                        } else {
+                            ESP_LOGI(TAG, "resp text=%s anim=%s motion=%s af=%s", meta.text, meta.anim, meta.motion,
+                                     meta.af[0] ? meta.af : "(none)");
+                        }
+
+                        // 根据是否有下行音频，决定进入播放期还是直接回等待期
+                        if (got_audio || is_playback_active(c)) {
+                            ESP_LOGI(TAG, "状态切换: 唤醒期 -> 播放期（等待下行播完再回等待期）");
+                            c->phase = CHAT_PHASE_PLAYBACK;
+                        } else {
+                            ESP_LOGI(TAG, "状态切换: 唤醒期 -> 等待期（无下行音频）");
+                            c->phase = CHAT_PHASE_WAITING;
+                        }
+                    } else {
+                        ESP_LOGI(TAG, "状态切换: 唤醒期 -> 等待期（WS 未连接）");
+                        c->phase = CHAT_PHASE_WAITING;
+                    }
+
+                    round_active = false;
                 }
             }
+        }
+
+        // 唤醒期：从 PSRAM 环形缓冲按 r_send 发送到 WS（带追帧/丢帧）
+        if (c->phase == CHAT_PHASE_WAKE && round_active && c->ws && app_rb3_ws_is_connected(c->ws)) {
+            if (should_abort_ws(&ab)) {
+                round_active = false;
+                continue;
+            }
+
+            uint64_t seq_w = __atomic_load_n(&c->pre_seq_w, __ATOMIC_ACQUIRE);
+            uint64_t min_seq = (seq_w > c->pre_cap) ? (seq_w - c->pre_cap) : 0;
+            if (c->send_seq_r < min_seq) {
+                uint64_t drop = min_seq - c->send_seq_r;
+                c->send_seq_r = min_seq;
+                ESP_LOGW(TAG, "丢帧: 超出缓存窗口，跳过 %" PRIu64 " bytes", drop);
+            }
+
+            uint64_t backlog64 = (seq_w >= c->send_seq_r) ? (seq_w - c->send_seq_r) : 0;
+            size_t backlog = (backlog64 > (uint64_t)SIZE_MAX) ? SIZE_MAX : (size_t)backlog64;
+
+            if (backlog > max_backlog) {
+                size_t drop = backlog - keep_backlog;
+                c->send_seq_r += drop;
+                uint32_t now = xTaskGetTickCount();
+                if (now - c->last_catchup_log_tick > pdMS_TO_TICKS(1000)) {
+                    c->last_catchup_log_tick = now;
+                    ESP_LOGW(TAG, "追帧: backlog=%u bytes，快进丢弃=%u bytes（保留约1s）",
+                             (unsigned)backlog, (unsigned)drop);
+                }
+                backlog = keep_backlog;
+            }
+
+            // 轻度节流：每轮最多发送 1~3 个 chunk
+            int chunks = 1;
+            if (backlog > c->bytes_per_sec) chunks = 3;
+            else if (backlog > (c->bytes_per_sec / 2)) chunks = 2;
+
+            for (int i = 0; i < chunks; ++i) {
+                seq_w = __atomic_load_n(&c->pre_seq_w, __ATOMIC_ACQUIRE);
+                if (c->send_seq_r >= seq_w) break;
+                size_t n = (size_t)(seq_w - c->send_seq_r);
+                if (n > (size_t)send_chunk) n = (size_t)send_chunk;
+                prebuf_copy(c, c->send_seq_r, txbuf, n);
+                esp_err_t sret = app_rb3_ws_send_bin(c->ws, txbuf, n, 2000);
+                if (sret != ESP_OK) {
+                    ESP_LOGW(TAG, "send failed: %s, back to WAITING and reconnect later", esp_err_to_name(sret));
+                    app_rb3_ws_close(c->ws);
+                    c->ws = NULL;
+                    c->phase = CHAT_PHASE_WAITING;
+                    round_active = false;
+                    break;
+                }
+                c->send_seq_r += n;
+                vTaskDelay(1);
+            }
         } else {
-            // timeout：检查等待期是否进入静默
+            // 非唤醒态：检查等待期是否进入静默
             if (c->phase == CHAT_PHASE_WAITING) {
+                TickType_t now = xTaskGetTickCount();
                 uint32_t elapsed_ms = (uint32_t)pdTICKS_TO_MS(now - c->last_activity_tick);
                 if (elapsed_ms >= idle_to_silent_ms) {
                     c->phase = CHAT_PHASE_SILENT;
-                    ESP_LOGI(TAG, "状态切换: 等待期 -> 静默期（空闲>=60s，模拟关闭WS/不保持连接）");
-                }
-            }
-        }
-    }
-}
-
-static void task_vad(void *arg)
-{
-    chat_ctx_t *c = (chat_ctx_t *)arg;
-
-    const int frame_ms = (c->cfg.frame_ms > 0) ? c->cfg.frame_ms : 20;
-    const int sr = (c->audio_cfg.sample_rate > 0) ? c->audio_cfg.sample_rate : 16000;
-    const int ch = (c->audio_cfg.channels > 0) ? c->audio_cfg.channels : 1;
-    const int bps = (c->audio_cfg.bits_per_sample > 0) ? c->audio_cfg.bits_per_sample : 16;
-    const int bytes_per_sample = bps / 8;
-    const int samples_per_frame = (sr * frame_ms) / 1000;
-    const int bytes_per_frame = samples_per_frame * ch * bytes_per_sample;
-
-    const int silence_stop_ms = (c->cfg.silence_stop_ms > 0) ? c->cfg.silence_stop_ms : 2000;
-    const int min_voice_ms = (c->cfg.min_voice_ms > 0) ? c->cfg.min_voice_ms : 1000;
-    const int max_record_ms = (c->cfg.max_record_ms > 0) ? c->cfg.max_record_ms : 15000;
-
-    const int stop_silence_frames = silence_stop_ms / frame_ms;
-    const int min_voice_frames = min_voice_ms / frame_ms;
-    const int max_frames = max_record_ms / frame_ms;
-
-    const float alpha = (c->cfg.noise_alpha > 0.0f && c->cfg.noise_alpha < 1.0f) ? c->cfg.noise_alpha : 0.01f;
-    const float th_mul = (c->cfg.th_mul > 0.5f) ? c->cfg.th_mul : 2.2f;
-    const float th_min = (c->cfg.th_min > 0.0f) ? c->cfg.th_min : 200.0f;
-
-    ESP_LOGI(TAG, "VAD cfg: frame=%dms bytes/frame=%d stop_silence=%dframes(=%dms) min_voice=%dframes(=%dms)",
-             frame_ms, bytes_per_frame, stop_silence_frames, silence_stop_ms, min_voice_frames, min_voice_ms);
-
-    uint8_t *frame = (uint8_t *)malloc((size_t)bytes_per_frame);
-    if (!frame) {
-        ESP_LOGE(TAG, "alloc frame failed");
-        vTaskDelete(NULL);
-        return;
-    }
-
-    // 预缓冲：用于“说话不足 1s 视为无效”，先缓存到达 1s 才真正发起一次请求
-    const int prebuf_frames = min_voice_frames;
-    const size_t prebuf_cap = (size_t)prebuf_frames * (size_t)bytes_per_frame;
-    uint8_t *prebuf = (uint8_t *)malloc(prebuf_cap);
-    if (!prebuf) {
-        ESP_LOGE(TAG, "alloc prebuf failed");
-        free(frame);
-        vTaskDelete(NULL);
-        return;
-    }
-
-    bool in_speech = false;
-    int on_cnt = 0;
-    int off_cnt = 0;
-    int voice_frames = 0;
-    int total_frames = 0;
-
-    size_t prebuf_len = 0;
-    uint8_t *rec = NULL;
-    size_t rec_len = 0;
-    size_t rec_cap = 0;
-    bool accepted = false; // 已达到 >=1s，有效输入
-
-    // 噪声底初始化：给个非零，避免一开始门限为 0
-    if (c->noise < 1.0f) c->noise = 300.0f;
-
-    while (1) {
-        esp_err_t err = app_speak_sound_mic_read(frame, (size_t)bytes_per_frame);
-        if (err != ESP_OK) {
-            ESP_LOGE(TAG, "mic read failed: %s", esp_err_to_name(err));
-            vTaskDelay(pdMS_TO_TICKS(50));
-            continue;
-        }
-
-        float level = 0.0f;
-        if (bps == 16) {
-            level = frame_mean_abs_16((const int16_t *)frame, samples_per_frame * ch);
-        } else {
-            // 目前工程只用 16bit，其他先用退化估计
-            const uint8_t *p = frame;
-            int64_t sum = 0;
-            for (int i = 0; i < bytes_per_frame; ++i) sum += p[i];
-            level = (float)sum / (float)bytes_per_frame;
-        }
-
-        float th = c->noise * th_mul;
-        if (th < th_min) th = th_min;
-        const bool voice = (level > th);
-
-        if (!in_speech) {
-            // 静音期更新噪声底
-            c->noise = c->noise * (1.0f - alpha) + level * alpha;
-
-            if (voice) {
-                on_cnt++;
-            } else {
-                on_cnt = 0;
-            }
-
-            if (on_cnt >= c->start_on_frames) {
-                // 进入说话
-                in_speech = true;
-                c->turn_id++;                 // 新一轮 turn
-                c->abort_token++;              // 若正在播放，立刻打断
-                flush_play_rb(c);
-
-                // reset
-                off_cnt = 0;
-                voice_frames = 0;
-                total_frames = 0;
-                prebuf_len = 0;
-                accepted = false;
-
-                if (rec) {
-                    free(rec);
-                    rec = NULL;
-                }
-                rec_len = 0;
-                rec_cap = 0;
-
-                ESP_LOGI(TAG, "speech start (turn=%" PRIu32 ", noise=%.1f th=%.1f)", c->turn_id, c->noise, th);
-            }
-            continue;
-        }
-
-        // in_speech == true：持续缓存帧
-        total_frames++;
-        if (voice) {
-            voice_frames++;
-            off_cnt = 0;
-        } else {
-            off_cnt++;
-        }
-
-        // 先塞 prebuf（最多 1 秒）
-        if (!accepted && prebuf_len + (size_t)bytes_per_frame <= prebuf_cap) {
-            memcpy(prebuf + prebuf_len, frame, (size_t)bytes_per_frame);
-            prebuf_len += (size_t)bytes_per_frame;
-        }
-
-        // 达到 >=1s 认为有效：把 prebuf + 后续帧都累计成一次 utterance（整句上传）
-        if (!accepted && voice_frames >= min_voice_frames) {
-            accepted = true;
-            // 把 prebuf 转入 rec
-            rec_cap = prebuf_len + (size_t)(bytes_per_frame * 10); // 先给点余量
-            rec = (uint8_t *)malloc(rec_cap);
-            if (!rec) {
-                ESP_LOGE(TAG, "alloc rec failed, drop utterance");
-                // 回到静默
-                in_speech = false;
-                on_cnt = 0;
-                continue;
-            }
-            memcpy(rec, prebuf, prebuf_len);
-            rec_len = prebuf_len;
-            ESP_LOGI(TAG, "speech accepted (>= %dms), start buffering/upload later", min_voice_ms);
-        }
-
-        // accepted 后，把当前帧继续 append 到 rec
-        if (accepted) {
-            if (rec_len + (size_t)bytes_per_frame > rec_cap) {
-                size_t nc = rec_cap ? rec_cap * 2 : (size_t)bytes_per_frame * 64;
-                while (nc < rec_len + (size_t)bytes_per_frame) nc *= 2;
-                // cap：max_record_ms
-                const size_t hard_cap = (size_t)max_frames * (size_t)bytes_per_frame;
-                if (nc > hard_cap) nc = hard_cap;
-                if (rec_len + (size_t)bytes_per_frame > nc) {
-                    // 到达硬上限，强制结束
-                    off_cnt = stop_silence_frames;
-                } else {
-                    uint8_t *p = (uint8_t *)realloc(rec, nc);
-                    if (p) {
-                        rec = p;
-                        rec_cap = nc;
-                    } else {
-                        // 内存不足，强制结束
-                        off_cnt = stop_silence_frames;
+                    ESP_LOGI(TAG, "状态切换: 等待期 -> 静默期（空闲>=60s，关闭WS）");
+                    if (c->ws) {
+                        app_rb3_ws_close(c->ws);
+                        c->ws = NULL;
                     }
                 }
             }
-            if (rec && rec_len + (size_t)bytes_per_frame <= rec_cap) {
-                memcpy(rec + rec_len, frame, (size_t)bytes_per_frame);
-                rec_len += (size_t)bytes_per_frame;
-            }
-        }
-
-        // 结束条件：静音连续 2s 或超过最大时长
-        if (off_cnt >= stop_silence_frames || total_frames >= max_frames) {
-            const bool valid = (voice_frames >= min_voice_frames);
-            if (!valid) {
-                // 无效：说话不到 1s，直接回到静默
-                ESP_LOGI(TAG, "speech too short (<%dms), ignore and back to idle", min_voice_ms);
-                if (rec) {
-                    free(rec);
-                    rec = NULL;
-                }
-            } else {
-                // 投递给 NET 任务
-                utterance_t utt = {
-                    .pcm = rec,
-                    .pcm_len = rec_len,
-                    .turn_id = c->turn_id,
-                };
-                rec = NULL; // ownership moved
-                if (xQueueSend(c->q_utt, &utt, pdMS_TO_TICKS(50)) != pdTRUE) {
-                    ESP_LOGW(TAG, "utt queue full, drop");
-                    free(utt.pcm);
-                } else {
-                    ESP_LOGI(TAG, "speech end, send to server: %u bytes (turn=%" PRIu32 ")", (unsigned)utt.pcm_len, utt.turn_id);
-                }
-            }
-
-            // reset to idle
-            in_speech = false;
-            on_cnt = 0;
-            off_cnt = 0;
-            voice_frames = 0;
-            total_frames = 0;
-            prebuf_len = 0;
-            accepted = false;
+            vTaskDelay(pdMS_TO_TICKS(20));
         }
     }
 }
@@ -531,16 +573,19 @@ esp_err_t task_chat_continue_start(const task_chat_continue_cfg_t *cfg)
     ESP_RETURN_ON_FALSE(c->q_evt, ESP_ERR_NO_MEM, TAG, "create q_evt failed");
 
     // 播放 ringbuffer：先给 64KB，足够缓存短句 TTS，后续可调大
-    c->rb_play = xRingbufferCreate(64 * 1024, RINGBUF_TYPE_BYTEBUF);
+    // 之前 64KB 容易满（服务端下行音频一段会超过这个量），先增大到 256KB
+    // 进一步增大到 512KB：降低下行灌入/播放争抢导致的 underrun
+    c->rb_play = xRingbufferCreate(512 * 1024, RINGBUF_TYPE_BYTEBUF);
     ESP_RETURN_ON_FALSE(c->rb_play, ESP_ERR_NO_MEM, TAG, "create rb_play failed");
 
-    // pre-roll buffer：默认存 5 秒，取其中前 1.5 秒用于“提前上传”
+    // 统一：PSRAM 环形缓冲始终循环存麦克风 PCM
     const int sr = (c->audio_cfg.sample_rate > 0) ? c->audio_cfg.sample_rate : 16000;
     const int ch = (c->audio_cfg.channels > 0) ? c->audio_cfg.channels : 1;
     const int bps = (c->audio_cfg.bits_per_sample > 0) ? c->audio_cfg.bits_per_sample : 16;
     const int bytes_per_sample = bps / 8;
     const size_t bytes_per_sec = (size_t)sr * (size_t)ch * (size_t)bytes_per_sample;
-    c->pre_cap = bytes_per_sec * 5; // 5s
+    c->bytes_per_sec = bytes_per_sec;
+    c->pre_cap = bytes_per_sec * 5; // 5s 历史缓存
     c->pre_preroll_bytes = (bytes_per_sec * 1500) / 1000; // 1.5s
     c->pre_rb = (uint8_t *)heap_caps_malloc(c->pre_cap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!c->pre_rb) {
@@ -548,9 +593,18 @@ esp_err_t task_chat_continue_start(const task_chat_continue_cfg_t *cfg)
         c->pre_rb = (uint8_t *)malloc(c->pre_cap);
     }
     ESP_RETURN_ON_FALSE(c->pre_rb, ESP_ERR_NO_MEM, TAG, "alloc prebuf failed");
-    c->pre_w = 0;
-    c->pre_full = false;
     c->phase = CHAT_PHASE_WAITING;
+    c->pre_seq_w = 0;
+    c->send_seq_r = 0;
+    c->last_catchup_log_tick = 0;
+
+    // 播放预缓冲：默认至少 0.5s 才开始播（降低首句延迟）
+    c->play_prefill_bytes = (uint32_t)(bytes_per_sec / 2);
+    c->play_bytes_in = 0;
+    // 播放背压水位：放宽一点，减少“灌入被频繁暂停”造成的断续
+    // 高水位 8s、低水位 4s（16k/16bit/mono 下约 256KB / 128KB）
+    c->play_high_wm_bytes = (uint32_t)(bytes_per_sec * 8);
+    c->play_low_wm_bytes = (uint32_t)(bytes_per_sec * 4);
 
     // 启动 SpeakState：由它独占 mic_read；Continue 通过回调拿到音频帧与说话状态
     app_speak_state_cfg_t scfg = app_speak_state_cfg_default();

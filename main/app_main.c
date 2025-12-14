@@ -62,7 +62,8 @@ void app_main(void)
 
     // 初始化音频（BSP + esp_codec_dev）
     app_speak_sound_cfg_t cfg = {
-        .sample_rate = 16000,
+        // 全链路统一 24 kHz
+        .sample_rate = 24000,
         .channels = 1,
         .bits_per_sample = 16,
         .volume = 95,

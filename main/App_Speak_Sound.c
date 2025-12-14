@@ -18,7 +18,8 @@ static const char *TAG = "App_Speak_Sound";
 static esp_codec_dev_handle_t s_spk = NULL;
 static esp_codec_dev_handle_t s_mic = NULL;
 static app_speak_sound_cfg_t s_cfg = {
-    .sample_rate = 16000,
+    // 全链路改为 24 kHz
+    .sample_rate = 24000,
     .channels = 1,
     .bits_per_sample = 16,
     .volume = 80,

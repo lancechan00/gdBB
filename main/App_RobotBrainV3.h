@@ -40,6 +40,7 @@ typedef struct {
 
 typedef esp_err_t (*app_rb3_on_audio_cb)(const uint8_t *pcm, size_t pcm_len, bool is_last, void *ctx);
 typedef bool (*app_rb3_should_abort_cb)(void *ctx);
+typedef struct app_rb3_ws_sess_t app_rb3_ws_sess_t;
 
 /**
  * @brief 发送 v3 服务端事件请求（HTTP: POST /v1/robot/event），并按序回调输出 audio 分片
@@ -91,6 +92,25 @@ esp_err_t app_rb3_ws_voice_stream(const app_rb3_cfg_t *cfg,
                                  void *cb_ctx,
                                  app_rb3_should_abort_cb should_abort,
                                  void *abort_ctx);
+
+/**
+ * @brief WS 会话（长连接）API：用于“等待期常连、唤醒期 start/bin/end”的模式。
+ *
+ * @note 目前只支持文本下行（服务端 audio 为 JSON+base64），与现有 ws_voice_stream 一致。
+ *       会话保持连接：recv_until_last 返回后不会关闭连接。
+ */
+esp_err_t app_rb3_ws_open(const app_rb3_cfg_t *cfg, app_rb3_ws_sess_t **out_sess);
+bool app_rb3_ws_is_connected(app_rb3_ws_sess_t *sess);
+void app_rb3_ws_close(app_rb3_ws_sess_t *sess);
+esp_err_t app_rb3_ws_send_start(app_rb3_ws_sess_t *sess, const char *req_id, const char *audio_format);
+esp_err_t app_rb3_ws_send_bin(app_rb3_ws_sess_t *sess, const uint8_t *data, size_t len, int timeout_ms);
+esp_err_t app_rb3_ws_send_end(app_rb3_ws_sess_t *sess);
+esp_err_t app_rb3_ws_recv_until_last(app_rb3_ws_sess_t *sess,
+                                     app_rb3_meta_t *out_meta,  // 可为 NULL
+                                     app_rb3_on_audio_cb on_audio,
+                                     void *cb_ctx,
+                                     app_rb3_should_abort_cb should_abort,
+                                     void *abort_ctx);
 
 /**
  * @brief 默认配置（只填 base_url 即可用）

@@ -476,6 +476,262 @@ static void ws_event_handler(void *handler_args, esp_event_base_t base, int32_t 
     }
 }
 
+typedef struct app_rb3_ws_sess_t {
+    esp_websocket_client_handle_t client;
+    ws_rx_ctx_t rx;
+    uint8_t *tmp;
+    size_t tmp_cap;
+    app_rb3_cfg_t cfg; // 保存一份 cfg（指针字段由调用方保证生命周期）
+} app_rb3_ws_sess_t;
+
+static esp_err_t ws_wait_connected(esp_websocket_client_handle_t client,
+                                   app_rb3_should_abort_cb should_abort,
+                                   void *abort_ctx,
+                                   int timeout_ms)
+{
+    uint32_t t0 = esp_log_timestamp();
+    while (!esp_websocket_client_is_connected(client)) {
+        if (should_abort && should_abort(abort_ctx)) return ESP_ERR_INVALID_STATE;
+        if ((int)(esp_log_timestamp() - t0) > timeout_ms) return ESP_ERR_TIMEOUT;
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+    return ESP_OK;
+}
+
+esp_err_t app_rb3_ws_open(const app_rb3_cfg_t *cfg, app_rb3_ws_sess_t **out_sess)
+{
+    ESP_RETURN_ON_FALSE(cfg && cfg->base_url && out_sess, ESP_ERR_INVALID_ARG, TAG, "arg invalid");
+    *out_sess = NULL;
+
+    char ws_url[256];
+    ESP_RETURN_ON_ERROR(build_ws_url(cfg->base_url, ws_url, sizeof(ws_url)), TAG, "build ws url failed");
+
+    esp_websocket_client_config_t wcfg = {
+        .uri = ws_url,
+        .buffer_size = 8192,
+        .task_stack = 4096,
+        .task_prio = 5,
+        .reconnect_timeout_ms = 0,
+        .network_timeout_ms = 10000,
+        .disable_auto_reconnect = true,
+    };
+
+    app_rb3_ws_sess_t *s = (app_rb3_ws_sess_t *)calloc(1, sizeof(*s));
+    ESP_RETURN_ON_FALSE(s, ESP_ERR_NO_MEM, TAG, "alloc sess failed");
+    s->cfg = *cfg;
+
+    s->client = esp_websocket_client_init(&wcfg);
+    if (!s->client) {
+        free(s);
+        return ESP_FAIL;
+    }
+
+    s->rx.q = xQueueCreate(16, sizeof(char *));
+    if (!s->rx.q) {
+        esp_websocket_client_destroy(s->client);
+        free(s);
+        return ESP_ERR_NO_MEM;
+    }
+    s->rx.assem = NULL;
+    s->rx.assem_len = 0;
+
+    ESP_ERROR_CHECK(esp_websocket_register_events(s->client, WEBSOCKET_EVENT_ANY, ws_event_handler, &s->rx));
+    esp_err_t ret = esp_websocket_client_start(s->client);
+    if (ret != ESP_OK) {
+        ws_rx_ctx_reset(&s->rx);
+        vQueueDelete(s->rx.q);
+        esp_websocket_client_destroy(s->client);
+        free(s);
+        return ret;
+    }
+
+    // 等待连接建立
+    ret = ws_wait_connected(s->client, NULL, NULL, 5000);
+    if (ret != ESP_OK) {
+        app_rb3_ws_close(s);
+        return ret;
+    }
+
+    *out_sess = s;
+    return ESP_OK;
+}
+
+bool app_rb3_ws_is_connected(app_rb3_ws_sess_t *sess)
+{
+    if (!sess || !sess->client) return false;
+    return esp_websocket_client_is_connected(sess->client);
+}
+
+void app_rb3_ws_close(app_rb3_ws_sess_t *sess)
+{
+    if (!sess) return;
+
+    if (sess->client) {
+        esp_websocket_client_stop(sess->client);
+        esp_websocket_client_destroy(sess->client);
+        sess->client = NULL;
+    }
+
+    // 清空队列中的残留消息
+    if (sess->rx.q) {
+        char *rx = NULL;
+        while (xQueueReceive(sess->rx.q, &rx, 0) == pdTRUE) {
+            if (rx) free(rx);
+        }
+        vQueueDelete(sess->rx.q);
+        sess->rx.q = NULL;
+    }
+    ws_rx_ctx_reset(&sess->rx);
+
+    if (sess->tmp) free(sess->tmp);
+    sess->tmp = NULL;
+    sess->tmp_cap = 0;
+
+    free(sess);
+}
+
+esp_err_t app_rb3_ws_send_start(app_rb3_ws_sess_t *sess, const char *req_id, const char *audio_format)
+{
+    ESP_RETURN_ON_FALSE(sess && sess->client, ESP_ERR_INVALID_ARG, TAG, "sess invalid");
+    ESP_RETURN_ON_FALSE(esp_websocket_client_is_connected(sess->client), ESP_ERR_INVALID_STATE, TAG, "ws not connected");
+
+    const char *req = req_id; // 可为 NULL
+    const char *af_out = sess->cfg.af ? sess->cfg.af : (audio_format ? audio_format : "pcm16");
+    const char *voice = sess->cfg.voice ? sess->cfg.voice : "alloy";
+    const char *model = sess->cfg.model ? sess->cfg.model : "gpt-realtime-mini";
+
+    char start_msg[256];
+    int slen = 0;
+    if (req) {
+        slen = snprintf(start_msg, sizeof(start_msg),
+                        "{\"type\":\"start\",\"req\":\"%s\",\"af\":\"%s\",\"voice\":\"%s\",\"model\":\"%s\"}",
+                        req, af_out, voice, model);
+    } else {
+        slen = snprintf(start_msg, sizeof(start_msg),
+                        "{\"type\":\"start\",\"af\":\"%s\",\"voice\":\"%s\",\"model\":\"%s\"}",
+                        af_out, voice, model);
+    }
+    ESP_RETURN_ON_FALSE(slen > 0 && slen < (int)sizeof(start_msg), ESP_ERR_INVALID_SIZE, TAG, "start msg too long");
+
+    int wr = esp_websocket_client_send_text(sess->client, start_msg, slen, pdMS_TO_TICKS(2000));
+    return (wr > 0) ? ESP_OK : ESP_FAIL;
+}
+
+esp_err_t app_rb3_ws_send_bin(app_rb3_ws_sess_t *sess, const uint8_t *data, size_t len, int timeout_ms)
+{
+    ESP_RETURN_ON_FALSE(sess && sess->client && data && len > 0, ESP_ERR_INVALID_ARG, TAG, "arg invalid");
+    ESP_RETURN_ON_FALSE(esp_websocket_client_is_connected(sess->client), ESP_ERR_INVALID_STATE, TAG, "ws not connected");
+    if (timeout_ms <= 0) timeout_ms = 2000;
+    int wr = esp_websocket_client_send_bin(sess->client, (const char *)data, (int)len, pdMS_TO_TICKS(timeout_ms));
+    return (wr > 0 && wr == (int)len) ? ESP_OK : ESP_FAIL;
+}
+
+esp_err_t app_rb3_ws_send_end(app_rb3_ws_sess_t *sess)
+{
+    ESP_RETURN_ON_FALSE(sess && sess->client, ESP_ERR_INVALID_ARG, TAG, "sess invalid");
+    ESP_RETURN_ON_FALSE(esp_websocket_client_is_connected(sess->client), ESP_ERR_INVALID_STATE, TAG, "ws not connected");
+    const char *end_msg = "{\"type\":\"end\"}";
+    int wr = esp_websocket_client_send_text(sess->client, end_msg, (int)strlen(end_msg), pdMS_TO_TICKS(2000));
+    return (wr > 0) ? ESP_OK : ESP_FAIL;
+}
+
+esp_err_t app_rb3_ws_recv_until_last(app_rb3_ws_sess_t *sess,
+                                     app_rb3_meta_t *out_meta,
+                                     app_rb3_on_audio_cb on_audio,
+                                     void *cb_ctx,
+                                     app_rb3_should_abort_cb should_abort,
+                                     void *abort_ctx)
+{
+    ESP_RETURN_ON_FALSE(sess && sess->client && sess->rx.q && on_audio, ESP_ERR_INVALID_ARG, TAG, "arg invalid");
+    ESP_RETURN_ON_FALSE(esp_websocket_client_is_connected(sess->client), ESP_ERR_INVALID_STATE, TAG, "ws not connected");
+
+    if (out_meta) memset(out_meta, 0, sizeof(*out_meta));
+    size_t text_len = 0;
+    bool got_last = false;
+
+    while (!got_last) {
+        if (should_abort && should_abort(abort_ctx)) return ESP_ERR_INVALID_STATE;
+
+        char *rx = NULL;
+        if (xQueueReceive(sess->rx.q, &rx, pdMS_TO_TICKS(3000)) != pdTRUE) {
+            if (!esp_websocket_client_is_connected(sess->client)) return ESP_FAIL;
+            continue;
+        }
+        if (rx == NULL) {
+            return ESP_FAIL;
+        }
+
+        char type[16] = {0};
+        json_extract_string_inplace(rx, "\"type\"", type, sizeof(type));
+        if (strcmp(type, "meta") == 0) {
+            if (out_meta) {
+                json_extract_string_inplace(rx, "\"req\"", out_meta->req, sizeof(out_meta->req));
+                json_extract_string_inplace(rx, "\"rid\"", out_meta->rid, sizeof(out_meta->rid));
+                json_extract_string_inplace(rx, "\"anim\"", out_meta->anim, sizeof(out_meta->anim));
+                json_extract_string_inplace(rx, "\"motion\"", out_meta->motion, sizeof(out_meta->motion));
+                json_extract_string_inplace(rx, "\"af\"", out_meta->af, sizeof(out_meta->af));
+            }
+        } else if (strcmp(type, "asr_text") == 0) {
+            if (out_meta) {
+                json_extract_string_inplace(rx, "\"text\"", out_meta->text, sizeof(out_meta->text));
+                text_len = strlen(out_meta->text);
+            }
+        } else if (strcmp(type, "text_delta") == 0) {
+            if (out_meta) {
+                char delta[128] = {0};
+                json_extract_string_inplace(rx, "\"text\"", delta, sizeof(delta));
+                if (delta[0]) {
+                    size_t dlen = strlen(delta);
+                    size_t cap = sizeof(out_meta->text);
+                    if (text_len < cap - 1) {
+                        size_t can = cap - 1 - text_len;
+                        if (dlen > can) dlen = can;
+                        memcpy(out_meta->text + text_len, delta, dlen);
+                        text_len += dlen;
+                        out_meta->text[text_len] = '\0';
+                    }
+                }
+            }
+        } else if (strcmp(type, "text") == 0) {
+            if (out_meta) {
+                json_extract_string_inplace(rx, "\"text\"", out_meta->text, sizeof(out_meta->text));
+                text_len = strlen(out_meta->text);
+            }
+        } else if (strcmp(type, "audio") == 0) {
+            bool is_last = json_extract_bool(rx, "\"is_last\"");
+            const char *b64 = NULL;
+            size_t b64_len = 0;
+            if (json_extract_b64_chunk(rx, "\"chunk\"", &b64, &b64_len) == ESP_OK && b64 && b64_len > 0) {
+                size_t need = (b64_len / 4) * 3 + 4;
+                if (need > sess->tmp_cap) {
+                    uint8_t *p = (uint8_t *)realloc(sess->tmp, need);
+                    if (!p) {
+                        free(rx);
+                        return ESP_ERR_NO_MEM;
+                    }
+                    sess->tmp = p;
+                    sess->tmp_cap = need;
+                }
+                size_t out_len = 0;
+                int mret = mbedtls_base64_decode(sess->tmp, sess->tmp_cap, &out_len,
+                                                 (const unsigned char *)b64, b64_len);
+                if (mret == 0 && out_len > 0) {
+                    esp_err_t cbret = on_audio(sess->tmp, out_len, is_last, cb_ctx);
+                    if (cbret != ESP_OK) {
+                        free(rx);
+                        return cbret;
+                    }
+                }
+            }
+            if (is_last) got_last = true;
+        }
+
+        free(rx);
+    }
+
+    return ESP_OK;
+}
+
 esp_err_t app_rb3_http_voice_stream(const app_rb3_cfg_t *cfg,
                                    const uint8_t *pcm,
                                    size_t pcm_len,
