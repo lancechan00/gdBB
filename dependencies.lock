@@ -1,0 +1,27 @@
+dependencies:
+  espressif/esp_secure_cert_mgr:
+    component_hash: e8ce8d5ac0ef4ef5df12fdb266190413c4170ad39b394435f0e3115a4fddc6a6
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=4.3'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 2.7.2
+  idf:
+    source:
+      type: idf
+    version: 5.4.3
+  protocol_examples_common:
+    dependencies: []
+    source:
+      path: /Users/mac/esp/v5.4.3/esp-idf/examples/common_components/protocol_examples_common
+      type: local
+    version: '*'
+direct_dependencies:
+- espressif/esp_secure_cert_mgr
+- protocol_examples_common
+manifest_hash: f73db4b583364bbbbfa51e6b930e8230d544a76e44d5880e089b18ddce22a46d
+target: esp32s3
+version: 2.0.0
