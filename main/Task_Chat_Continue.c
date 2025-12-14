@@ -13,11 +13,13 @@
 #include "esp_log.h"
 #include "esp_netif.h"
 #include <inttypes.h>
+#include "esp_heap_caps.h"
 #include "nvs_flash.h"
 #include "protocol_examples_common.h"
 
 #include "App_Speak_Sound.h"
 #include "App_RobotBrainV3.h"
+#include "App_SpeakState.h"
 
 static const char *TAG = "Task_Chat_Continue";
 
@@ -27,11 +29,28 @@ typedef struct {
     uint32_t turn_id;
 } utterance_t;
 
+typedef enum {
+    CHAT_PHASE_SILENT = 0,   // 静默期：无 WS（当前仅日志模拟）
+    CHAT_PHASE_WAITING = 1,  // 等待期：WS 常连但不上传（当前仅日志模拟）
+    CHAT_PHASE_WAKE = 2,     // 唤醒期：持续上传（当前仅日志模拟）
+} chat_phase_t;
+
+typedef enum {
+    CHAT_EVT_SPEAK_ON = 1,
+    CHAT_EVT_SPEAK_OFF = 2,
+} chat_evt_type_t;
+
+typedef struct {
+    chat_evt_type_t type;
+    uint32_t tick;
+} chat_evt_t;
+
 typedef struct {
     task_chat_continue_cfg_t cfg;
     app_speak_sound_cfg_t audio_cfg;
 
     QueueHandle_t q_utt;          // utterance_t*
+    QueueHandle_t q_evt;          // chat_evt_t
     RingbufHandle_t rb_play;      // raw PCM bytes
 
     volatile uint32_t turn_id;    // 每次开始说话 +1（用于打断/丢弃旧音频）
@@ -41,7 +60,34 @@ typedef struct {
     // VAD
     float noise;
     int start_on_frames;          // 防抖：连续多少帧算开始
+
+    // phase
+    volatile chat_phase_t phase;
+    uint32_t last_activity_tick;
+
+    // pre-roll circular buffer (PSRAM)
+    uint8_t *pre_rb;
+    size_t pre_cap;
+    size_t pre_w;
+    bool pre_full;
+    size_t pre_preroll_bytes;     // 1.5s 对应 bytes
+
+    // wake logging (rate limit)
+    uint32_t wake_last_log_tick;
+    size_t wake_rt_bytes_acc;
 } chat_ctx_t;
+
+typedef struct {
+    chat_ctx_t *c;
+    uint32_t *last_abort_seen;
+} abort_ctx_t;
+
+static bool should_abort_ws(void *ctx)
+{
+    abort_ctx_t *a = (abort_ctx_t *)ctx;
+    if (!a || !a->c || !a->last_abort_seen) return true;
+    return a->c->abort_token != *(a->last_abort_seen);
+}
 
 static float frame_mean_abs_16(const int16_t *x, int n)
 {
@@ -128,54 +174,112 @@ static void task_play(void *arg)
     }
 }
 
+static void prebuf_write(chat_ctx_t *c, const uint8_t *data, size_t len)
+{
+    if (!c || !c->pre_rb || c->pre_cap == 0 || !data || len == 0) return;
+    // 静默期不存：按需求“静默->唤醒时无前1.5s”
+    if (c->phase == CHAT_PHASE_SILENT) return;
+
+    size_t off = 0;
+    while (off < len) {
+        size_t n = len - off;
+        size_t space = c->pre_cap - c->pre_w;
+        if (n > space) n = space;
+        memcpy(c->pre_rb + c->pre_w, data + off, n);
+        c->pre_w += n;
+        off += n;
+        if (c->pre_w >= c->pre_cap) {
+            c->pre_w = 0;
+            c->pre_full = true;
+        }
+    }
+}
+
+static void on_speak_state_change(app_speak_state_t st, void *ctx)
+{
+    chat_ctx_t *c = (chat_ctx_t *)ctx;
+    if (!c || !c->q_evt) return;
+    chat_evt_t ev = {
+        .type = (st == APP_SPEAK_STATE_SPEAKING) ? CHAT_EVT_SPEAK_ON : CHAT_EVT_SPEAK_OFF,
+        .tick = xTaskGetTickCount(),
+    };
+    (void)xQueueSend(c->q_evt, &ev, 0);
+}
+
+static void on_speak_audio_frame(const uint8_t *pcm, int pcm_len, void *ctx)
+{
+    chat_ctx_t *c = (chat_ctx_t *)ctx;
+    if (!c || !pcm || pcm_len <= 0) return;
+
+    prebuf_write(c, pcm, (size_t)pcm_len);
+
+    // 唤醒期：模拟“实时上传”日志（限频，避免刷屏）
+    if (c->phase == CHAT_PHASE_WAKE) {
+        c->wake_rt_bytes_acc += (size_t)pcm_len;
+        uint32_t now = xTaskGetTickCount();
+        if (now - c->wake_last_log_tick >= pdMS_TO_TICKS(500)) {
+            c->wake_last_log_tick = now;
+            ESP_LOGI(TAG, "唤醒期: 模拟实时上传中... +%u bytes", (unsigned)c->wake_rt_bytes_acc);
+            c->wake_rt_bytes_acc = 0;
+        }
+    }
+}
+
 static void task_net(void *arg)
 {
     chat_ctx_t *c = (chat_ctx_t *)arg;
+    // 先不做真实 WS：只用日志模拟三态 + “前1.5s + 实时”发送顺序
+    c->phase = CHAT_PHASE_WAITING;
+    c->last_activity_tick = xTaskGetTickCount();
+    ESP_LOGI(TAG, "状态切换: 启动 -> 等待期（WS常连但不上传，开始循环存音频）");
+    ESP_LOGI(TAG, "规则: 等待期空闲60s -> 静默期；静默期说话 -> 唤醒期(无前1.5s)；等待期说话 -> 唤醒期(先前1.5s再实时)；说完->等待期(end不关WS)");
 
-    ESP_ERROR_CHECK(nvs_flash_init());
-    ESP_ERROR_CHECK(esp_netif_init());
-    ESP_ERROR_CHECK(esp_event_loop_create_default());
-    ESP_ERROR_CHECK(example_connect());
-
-    app_rb3_cfg_t rb3 = app_rb3_cfg_default(c->cfg.base_url);
-    rb3.af = "pcm_16k_16bit";
-    rb3.mode = "stream";
-    rb3.chunk_bytes = 500;
+    const uint32_t idle_to_silent_ms = 60000;
+    const TickType_t wait_ticks = pdMS_TO_TICKS(200);
 
     while (1) {
-        utterance_t utt = {0};
-        if (xQueueReceive(c->q_utt, &utt, portMAX_DELAY) != pdTRUE) {
-            continue;
-        }
-
-        // 若已被更新 turn_id（比如说话打断后立即新一轮），直接丢弃旧句子
-        if (utt.turn_id != c->turn_id) {
-            free(utt.pcm);
-            continue;
-        }
-
-        // 清空播放队列，准备新一轮回答
-        c->abort_token++;
-        flush_play_rb(c);
-
-        app_rb3_meta_t meta = {0};
-        esp_err_t err = app_rb3_http_voice_stream(&rb3,
-                                                  utt.pcm,
-                                                  utt.pcm_len,
-                                                  "pcm_16k_16bit",
-                                                  c->cfg.language ? c->cfg.language : "zh-CN",
-                                                  "r_chat",
-                                                  c->cfg.user_id ? c->cfg.user_id : "demo",
-                                                  &meta,
-                                                  on_audio_push_rb,
-                                                  c);
-        if (err != ESP_OK) {
-            ESP_LOGE(TAG, "voice http failed: %s", esp_err_to_name(err));
+        chat_evt_t ev = {0};
+        TickType_t now = xTaskGetTickCount();
+        if (xQueueReceive(c->q_evt, &ev, wait_ticks) == pdTRUE) {
+            uint32_t tnow = xTaskGetTickCount();
+            if (ev.type == CHAT_EVT_SPEAK_ON) {
+                if (c->phase == CHAT_PHASE_WAITING) {
+                    c->phase = CHAT_PHASE_WAKE;
+                    c->last_activity_tick = tnow;
+                    c->wake_last_log_tick = tnow;
+                    c->wake_rt_bytes_acc = 0;
+                    ESP_LOGI(TAG, "状态切换: 等待期 -> 唤醒期");
+                    ESP_LOGI(TAG, "模拟发送: 先发前1.5s缓存 bytes=%u，再发实时数据", (unsigned)c->pre_preroll_bytes);
+                } else if (c->phase == CHAT_PHASE_SILENT) {
+                    c->phase = CHAT_PHASE_WAKE;
+                    c->last_activity_tick = tnow;
+                    c->wake_last_log_tick = tnow;
+                    c->wake_rt_bytes_acc = 0;
+                    ESP_LOGI(TAG, "状态切换: 静默期 -> 唤醒期");
+                    ESP_LOGI(TAG, "模拟发送: 静默期无前1.5s，直接发实时数据");
+                } else {
+                    c->last_activity_tick = tnow;
+                }
+            } else if (ev.type == CHAT_EVT_SPEAK_OFF) {
+                if (c->phase == CHAT_PHASE_WAKE) {
+                    c->phase = CHAT_PHASE_WAITING;
+                    c->last_activity_tick = tnow;
+                    ESP_LOGI(TAG, "状态切换: 唤醒期 -> 等待期");
+                    ESP_LOGI(TAG, "模拟发送: end（保持WS，不关闭；回到等待期继续循环存音频）");
+                } else {
+                    c->last_activity_tick = tnow;
+                }
+            }
         } else {
-            ESP_LOGI(TAG, "resp text=%s anim=%s motion=%s", meta.text, meta.anim, meta.motion);
+            // timeout：检查等待期是否进入静默
+            if (c->phase == CHAT_PHASE_WAITING) {
+                uint32_t elapsed_ms = (uint32_t)pdTICKS_TO_MS(now - c->last_activity_tick);
+                if (elapsed_ms >= idle_to_silent_ms) {
+                    c->phase = CHAT_PHASE_SILENT;
+                    ESP_LOGI(TAG, "状态切换: 等待期 -> 静默期（空闲>=60s，模拟关闭WS/不保持连接）");
+                }
+            }
         }
-
-        free(utt.pcm);
     }
 }
 
@@ -421,20 +525,48 @@ esp_err_t task_chat_continue_start(const task_chat_continue_cfg_t *cfg)
     ESP_RETURN_ON_FALSE(c, ESP_ERR_NO_MEM, TAG, "alloc ctx failed");
 
     c->cfg = cfg ? *cfg : cfg_default();
-    c->start_on_frames = 3;
     app_speak_sound_get_cfg(&c->audio_cfg);
 
-    c->q_utt = xQueueCreate(2, sizeof(utterance_t));
-    ESP_RETURN_ON_FALSE(c->q_utt, ESP_ERR_NO_MEM, TAG, "create q_utt failed");
+    c->q_evt = xQueueCreate(8, sizeof(chat_evt_t));
+    ESP_RETURN_ON_FALSE(c->q_evt, ESP_ERR_NO_MEM, TAG, "create q_evt failed");
 
     // 播放 ringbuffer：先给 64KB，足够缓存短句 TTS，后续可调大
     c->rb_play = xRingbufferCreate(64 * 1024, RINGBUF_TYPE_BYTEBUF);
     ESP_RETURN_ON_FALSE(c->rb_play, ESP_ERR_NO_MEM, TAG, "create rb_play failed");
 
+    // pre-roll buffer：默认存 5 秒，取其中前 1.5 秒用于“提前上传”
+    const int sr = (c->audio_cfg.sample_rate > 0) ? c->audio_cfg.sample_rate : 16000;
+    const int ch = (c->audio_cfg.channels > 0) ? c->audio_cfg.channels : 1;
+    const int bps = (c->audio_cfg.bits_per_sample > 0) ? c->audio_cfg.bits_per_sample : 16;
+    const int bytes_per_sample = bps / 8;
+    const size_t bytes_per_sec = (size_t)sr * (size_t)ch * (size_t)bytes_per_sample;
+    c->pre_cap = bytes_per_sec * 5; // 5s
+    c->pre_preroll_bytes = (bytes_per_sec * 1500) / 1000; // 1.5s
+    c->pre_rb = (uint8_t *)heap_caps_malloc(c->pre_cap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!c->pre_rb) {
+        ESP_LOGW(TAG, "PSRAM alloc prebuf failed, fallback to internal heap (%u bytes)", (unsigned)c->pre_cap);
+        c->pre_rb = (uint8_t *)malloc(c->pre_cap);
+    }
+    ESP_RETURN_ON_FALSE(c->pre_rb, ESP_ERR_NO_MEM, TAG, "alloc prebuf failed");
+    c->pre_w = 0;
+    c->pre_full = false;
+    c->phase = CHAT_PHASE_WAITING;
+
+    // 启动 SpeakState：由它独占 mic_read；Continue 通过回调拿到音频帧与说话状态
+    app_speak_state_cfg_t scfg = app_speak_state_cfg_default();
+    scfg.window_ms = 500;
+    scfg.frame_ms = 20;
+    scfg.th_avg_abs = 60;          // 默认：avg_abs > 90 才算有声
+    scfg.on_need_windows = 3;      // 0.5s*4=2s
+    scfg.off_need_windows = 6;     // 0.5s*6=3s
+    scfg.log_state_change = false; // 由 Continue 统一打印“静默/等待/唤醒”
+    scfg.on_audio = on_speak_audio_frame;
+    scfg.on_audio_ctx = c;
+    ESP_RETURN_ON_ERROR(app_speak_state_start(&scfg, on_speak_state_change, c), TAG, "start speak state failed");
+
     BaseType_t ok1 = xTaskCreate(task_play, "task_chat_play", 4096, c, 6, NULL);
-    BaseType_t ok2 = xTaskCreate(task_net, "task_chat_net", 8192, c, 5, NULL);
-    BaseType_t ok3 = xTaskCreate(task_vad, "task_chat_vad", 6144, c, 7, NULL);
-    ESP_RETURN_ON_FALSE(ok1 == pdPASS && ok2 == pdPASS && ok3 == pdPASS, ESP_FAIL, TAG, "create task failed");
+    BaseType_t ok2 = xTaskCreate(task_net, "task_chat_state", 6144, c, 5, NULL);
+    ESP_RETURN_ON_FALSE(ok1 == pdPASS && ok2 == pdPASS, ESP_FAIL, TAG, "create task failed");
 
     ESP_LOGI(TAG, "Task_Chat_Continue started, base_url=%s", c->cfg.base_url ? c->cfg.base_url : "(null)");
     return ESP_OK;

@@ -4,12 +4,14 @@ idf_component_register(
         "App_Speak_Sound.c"
         "Task_Sound_Selftest.c"
         "Task_Speak_Selftest.c"
+        "App_SpeakState.c"
         "App_RobotBrainV3.c"
         "Task_v3interface_selftest.c"
         "Task_Chat_Continue.c"
     INCLUDE_DIRS "."
     PRIV_REQUIRES
         esp_http_client
+        esp_websocket_client
         esp-tls
         mbedtls
         esp_netif

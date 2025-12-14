@@ -80,7 +80,7 @@ void app_main(void)
     // 麦克风自检：录 5 秒并回放（验证 RX->TX）
     // ESP_ERROR_CHECK(task_speak_selftest_start());
 
-    // 连续语音助手（VAD：有声开始，静音 2s 结束；播放中说话即打断）
+    // 连续语音助手（当前：WS 逻辑先用日志模拟，不做真实连接/发送）
     task_chat_continue_cfg_t chat_cfg = {
         .base_url = "http://192.168.31.193:8443",
         .user_id = "demo",

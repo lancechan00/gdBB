@@ -115,6 +115,16 @@ dependencies:
       registry_url: https://components.espressif.com/
       type: service
     version: 2.7.2
+  espressif/esp_websocket_client:
+    component_hash: 723aba370113196c66321442426cd6452c351eef31c85c83bd1446831ef9f8f4
+    dependencies:
+    - name: idf
+      require: private
+      version: '>=5.0'
+    source:
+      registry_url: https://components.espressif.com/
+      type: service
+    version: 1.6.0
   idf:
     source:
       type: idf
@@ -205,9 +215,10 @@ direct_dependencies:
 - espressif/es8311
 - espressif/esp_codec_dev
 - espressif/esp_secure_cert_mgr
+- espressif/esp_websocket_client
 - idf
 - protocol_examples_common
 - waveshare/esp32_s3_touch_amoled_1_75
-manifest_hash: f37dd997937ba86c9f0d624c2892290114a877debee7d0d719aaa9f8f34bf5a9
+manifest_hash: 68ad8c28cf6dce0d20a3965a4067d3c2fd9a814c95c8623e2a18c2493fa5f94a
 target: esp32s3
 version: 2.0.0
