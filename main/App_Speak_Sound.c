@@ -189,3 +189,17 @@ esp_err_t app_speak_sound_play_pcm(const void *buf, size_t bytes)
     }
     return ESP_OK;
 }
+
+esp_err_t app_speak_sound_mic_read(void *buf, size_t bytes)
+{
+    ESP_RETURN_ON_FALSE(s_mic, ESP_ERR_INVALID_STATE, TAG, "mic not init");
+    ESP_RETURN_ON_FALSE(buf && bytes > 0, ESP_ERR_INVALID_ARG, TAG, "bad args");
+    return esp_codec_dev_read(s_mic, (uint8_t *)buf, bytes);
+}
+
+esp_err_t app_speak_sound_spk_write(const void *buf, size_t bytes)
+{
+    ESP_RETURN_ON_FALSE(s_spk, ESP_ERR_INVALID_STATE, TAG, "speaker not init");
+    ESP_RETURN_ON_FALSE(buf && bytes > 0, ESP_ERR_INVALID_ARG, TAG, "bad args");
+    return esp_codec_dev_write(s_spk, (const uint8_t *)buf, bytes);
+}

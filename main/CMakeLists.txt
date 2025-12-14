@@ -6,6 +6,7 @@ idf_component_register(
         "Task_Speak_Selftest.c"
         "App_RobotBrainV3.c"
         "Task_v3interface_selftest.c"
+        "Task_Chat_Continue.c"
     INCLUDE_DIRS "."
     PRIV_REQUIRES
         esp_http_client

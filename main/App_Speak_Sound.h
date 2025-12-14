@@ -48,6 +48,20 @@ esp_err_t app_speak_sound_record(void *buf, size_t buf_bytes, size_t *out_bytes,
  */
 esp_err_t app_speak_sound_play_pcm(const void *buf, size_t bytes);
 
+/**
+ * @brief 从麦克风读取指定字节数 PCM（阻塞直到读满）
+ *
+ * @note 用于流式 VAD/上行；与 app_speak_sound_record() 不冲突，但请避免并发读。
+ */
+esp_err_t app_speak_sound_mic_read(void *buf, size_t bytes);
+
+/**
+ * @brief 向喇叭写入指定字节数 PCM（阻塞直到写入完成）
+ *
+ * @note 用于可中断播放：上层可分小块循环写并随时停止。
+ */
+esp_err_t app_speak_sound_spk_write(const void *buf, size_t bytes);
+
 #ifdef __cplusplus
 }
 #endif

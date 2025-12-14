@@ -25,6 +25,7 @@
 #include "Task_Sound_Selftest.h"
 #include "Task_Speak_Selftest.h"
 #include "Task_v3interface_selftest.h"
+#include "Task_Chat_Continue.h"
 
 static const char *TAG = "gdBB_main";
 
@@ -77,5 +78,21 @@ void app_main(void)
     // ESP_ERROR_CHECK(task_v3interface_selftest_start());
 
     // 麦克风自检：录 5 秒并回放（验证 RX->TX）
-    ESP_ERROR_CHECK(task_speak_selftest_start());
+    // ESP_ERROR_CHECK(task_speak_selftest_start());
+
+    // 连续语音助手（VAD：有声开始，静音 2s 结束；播放中说话即打断）
+    task_chat_continue_cfg_t chat_cfg = {
+        .base_url = "http://192.168.31.193:8443",
+        .user_id = "demo",
+        .language = "zh-CN",
+        .frame_ms = 20,
+        .silence_stop_ms = 2000,
+        .min_voice_ms = 1000,
+        .noise_alpha = 0.01f,
+        .th_mul = 2.2f,
+        .th_min = 200.0f,
+        .spk_chunk_bytes = 512,
+        .max_record_ms = 15000,
+    };
+    ESP_ERROR_CHECK(task_chat_continue_start(&chat_cfg));
 }

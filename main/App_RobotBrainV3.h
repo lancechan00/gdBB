@@ -51,6 +51,23 @@ esp_err_t app_rb3_http_event_stream(const app_rb3_cfg_t *cfg,
                                    void *cb_ctx);
 
 /**
+ * @brief 发送语音输入（HTTP: POST /v1/robot/voice），并按序回调输出 audio 分片
+ *
+ * @note 这是“整句上传”的实现：端上用 VAD 判停后把 PCM Base64 一次性提交。
+ *       若后续要更低延迟/边说边回，请改 WS /v3/robot/voice。
+ */
+esp_err_t app_rb3_http_voice_stream(const app_rb3_cfg_t *cfg,
+                                   const uint8_t *pcm,
+                                   size_t pcm_len,
+                                   const char *audio_format, // 例如 "pcm_16k_16bit" / "wav_16k_16bit"
+                                   const char *language,     // 例如 "zh-CN"
+                                   const char *req_id,
+                                   const char *user_id,
+                                   app_rb3_meta_t *out_meta, // 可为 NULL
+                                   app_rb3_on_audio_cb on_audio,
+                                   void *cb_ctx);
+
+/**
  * @brief 默认配置（只填 base_url 即可用）
  */
 app_rb3_cfg_t app_rb3_cfg_default(const char *base_url);
