@@ -1,5 +1,19 @@
 ## IDF Component Manager Manifest File
+
 dependencies:
+  # Required IDF version (Waveshare BSP requires >=5.3)
+  idf: ">=5.4.0"
+
+  # Keep existing deps used by current gdBB/app_main.c (MQTT mutual auth example)
   espressif/esp_secure_cert_mgr: "^2.0.2"
   protocol_examples_common:
     path: ${IDF_PATH}/examples/common_components/protocol_examples_common
+
+  # Official BSP for Waveshare ESP32-S3-Touch-AMOLED-1.75
+  waveshare/esp32_s3_touch_amoled_1_75: "^1.0.2"
+
+  # Audio building blocks (explicitly listed for your upcoming migration)
+  # NOTE: BSP itself already depends on esp_codec_dev.
+  esp_codec_dev: "^1.3.3"
+  espressif/es8311: "^1.0.0"
+  espressif/es7210: "^1.0.0"

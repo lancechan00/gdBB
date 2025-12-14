@@ -14,3 +14,4 @@ partition_table_get_partition_info(offset "--partition-name ${partition}" "offse
 esptool_py_flash_target_image(flash "${partition}" "${offset}" "${image_file}")
 
 target_add_binary_data(${CMAKE_PROJECT_NAME}.elf "main/mosquitto.org.crt" TEXT)
+

@@ -87,6 +87,8 @@ main/esp_secure_cert_data/
 main/client.crt
 main/client.key
 main/mosquitto.org.crt
+main/certs/dev-cert.pem
+main/certs/dev-key.pem
 
 # managed_components
 managed_components/

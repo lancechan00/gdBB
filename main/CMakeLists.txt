@@ -1,2 +1,19 @@
-idf_component_register(SRCS "app_main.c"
-                    INCLUDE_DIRS ".")
+idf_component_register(
+    SRCS
+        "app_main.c"
+        "App_Speak_Sound.c"
+        "Task_Sound_Selftest.c"
+        "Task_Speak_Selftest.c"
+        "App_RobotBrainV3.c"
+        "Task_v3interface_selftest.c"
+    INCLUDE_DIRS "."
+    PRIV_REQUIRES
+        esp_http_client
+        esp-tls
+        mbedtls
+        esp_netif
+        esp_event
+        esp_wifi
+        nvs_flash
+        protocol_examples_common
+)
