@@ -1,6 +1,7 @@
 #include "Task_Speak_Selftest.h"
 
 #include <string.h>
+#include <math.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -55,6 +56,41 @@ static void task_entry(void *arg)
     ESP_LOGI(TAG, "record done, bytes=%u", (unsigned)got);
 
     vTaskDelay(pdMS_TO_TICKS(200));
+
+    // 简单统计：RMS + 前 8 个采样，判断是否全 0 / 太小
+    if (got >= sizeof(int16_t)) {
+        int16_t *p16 = (int16_t *)buf;
+        size_t samples = got / sizeof(int16_t);
+        size_t n = samples > 4000 ? 4000 : samples;
+        int64_t sum_sq = 0;
+        for (size_t i = 0; i < n; ++i) {
+            int32_t v = p16[i];
+            sum_sq += (int64_t)v * v;
+        }
+        float rms = 0.0f;
+        if (n > 0) {
+            rms = sqrtf((float)sum_sq / (float)n);
+        }
+        ESP_LOGI(TAG, "record stats: samples=%u rms=%.1f first8=[%d,%d,%d,%d,%d,%d,%d,%d]",
+                 (unsigned)samples, rms,
+                 samples > 0 ? p16[0] : 0,
+                 samples > 1 ? p16[1] : 0,
+                 samples > 2 ? p16[2] : 0,
+                 samples > 3 ? p16[3] : 0,
+                 samples > 4 ? p16[4] : 0,
+                 samples > 5 ? p16[5] : 0,
+                 samples > 6 ? p16[6] : 0,
+                 samples > 7 ? p16[7] : 0);
+
+        // 软件增益（x10，限幅）让回放更接近日常听感；如有明显爆音再调小
+        const int gain = 10;
+        for (size_t i = 0; i < samples; ++i) {
+            int32_t v = (int32_t)p16[i] * gain;
+            if (v > INT16_MAX) v = INT16_MAX;
+            if (v < INT16_MIN) v = INT16_MIN;
+            p16[i] = (int16_t)v;
+        }
+    }
 
     // 回放
     ESP_LOGI(TAG, "start playback...");

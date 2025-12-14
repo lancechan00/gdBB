@@ -22,7 +22,8 @@ static app_speak_sound_cfg_t s_cfg = {
     .channels = 1,
     .bits_per_sample = 16,
     .volume = 80,
-    .mic_gain_db = 0,
+    // 经验值：不少板子默认增益偏小，先给一个更“容易听到”的值；可后续放到 menuconfig 调
+    .mic_gain_db = 36,
 };
 
 static esp_codec_dev_sample_info_t to_sample_info(const app_speak_sound_cfg_t *cfg)
@@ -90,9 +91,9 @@ esp_err_t app_speak_sound_init(const app_speak_sound_cfg_t *cfg)
     ESP_RETURN_ON_ERROR(esp_codec_dev_open(s_spk, &fs), TAG, "open spk failed");
 
     // mic
+    ESP_RETURN_ON_ERROR(esp_codec_dev_open(s_mic, &fs), TAG, "open mic failed");
     // 说明：不同 codec 对 gain 的单位/范围不完全一致，这里 best-effort。
     (void)esp_codec_dev_set_in_gain(s_mic, s_cfg.mic_gain_db);
-    ESP_RETURN_ON_ERROR(esp_codec_dev_open(s_mic, &fs), TAG, "open mic failed");
 
     ESP_LOGI(TAG, "audio inited: %d Hz, ch=%d, bits=%d", s_cfg.sample_rate, s_cfg.channels, s_cfg.bits_per_sample);
     return ESP_OK;

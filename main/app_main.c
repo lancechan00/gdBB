@@ -64,8 +64,8 @@ void app_main(void)
         .sample_rate = 16000,
         .channels = 1,
         .bits_per_sample = 16,
-        .volume = 85,
-        .mic_gain_db = 0,
+        .volume = 95,
+        .mic_gain_db = 42,
     };
     ESP_ERROR_CHECK(app_speak_sound_init(&cfg));
 
@@ -73,9 +73,9 @@ void app_main(void)
     ESP_ERROR_CHECK(task_sound_selftest_start());
     vTaskDelay(pdMS_TO_TICKS(1200));
 
-    // v3 HTTP 接口自检：拉一段音频并播放（像 06_I2SCodec 原来那样）
-    ESP_ERROR_CHECK(task_v3interface_selftest_start());
+    // v3 HTTP 接口自检：你已验证 OK，这里先注释，专注测试麦克风
+    // ESP_ERROR_CHECK(task_v3interface_selftest_start());
 
-    // 如还需要本地 MIC->SPK 自检，再打开这句
-    // ESP_ERROR_CHECK(task_speak_selftest_start());
+    // 麦克风自检：录 5 秒并回放（验证 RX->TX）
+    ESP_ERROR_CHECK(task_speak_selftest_start());
 }
